@@ -48,6 +48,9 @@ def main():
     # 监控弹窗2s钟，时间可能大于2s
     d.xpath.sleep_watch(2)
     d.xpath("转到上一层级").click()
+    
+    d.xpath("转到上一层级").click(watch=False) # click without trigger watch
+    d.xpath("转到上一层级").click(timeout=5.0) # wait timeout 5s
 
     # 一直在后台监控（目前每隔4s检查一次），暂时还没提供暂停的方法
     d.xpath.watch_background()
@@ -77,7 +80,19 @@ d.xpath.global_set("alias_strict", True) # 默认 False
 d.xpath("$返回").click() # 在这里会直接跑出XPathError异常
 ```
 
+遍历操作
+
+```python
+for el in d.xpath('//android.widget.EditText'):
+    print("rect:", el.rect) # output tuple: (x, y, width, height)
+    print("center:", el.center())
+    el.click() # click operation
+    print(el.elem) # 输出lxml解析出来的Node
+```
+
 ## XPath规则
+为了写起脚本来更快，我们自定义了一些简化的xpath规则
+
 **规则1**
 
 `//` 开头代表原生xpath
@@ -144,5 +159,6 @@ d.xpath("$返回").click() # 在这里会直接跑出XPathError异常
 ## 一些有用的网站
 - [XPath playground](https://scrapinghub.github.io/xpath-playground/)
 - [XPath的一些高级用法-简书](https://www.jianshu.com/p/4fef4142b33f)
+- [XPath Quicksheet](https://devhints.io/xpath)
 
 如有其他资料，欢迎提[Issues](https://github.com/openatx/uiautomator2/issues/new)补充
