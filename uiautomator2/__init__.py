@@ -30,6 +30,7 @@ import warnings
 from collections import namedtuple
 from datetime import datetime
 from subprocess import list2cmdline
+from typing import Optional
 
 import humanize
 import progress.bar
@@ -38,8 +39,8 @@ import six
 import six.moves.urllib.parse as urlparse
 from retry import retry
 
-from uiautomator2 import adbutils
-from uiautomator2.exceptions import (GatewayError, JsonRpcError, ConnectError,
+import adbutils
+from uiautomator2.exceptions import (ConnectError, GatewayError, JsonRpcError,
                                      NullObjectExceptionError,
                                      NullPointerExceptionError,
                                      SessionBrokenError,
@@ -48,6 +49,7 @@ from uiautomator2.exceptions import (GatewayError, JsonRpcError, ConnectError,
                                      UiObjectNotFoundError)
 from uiautomator2.session import Session, set_fail_prompt  # noqa: F401
 from uiautomator2.version import __atx_agent_version__
+from uiautomator2.utils import cache_return
 
 if six.PY2:
     FileNotFoundError = OSError
@@ -72,15 +74,22 @@ def log_print(s):
           " " + s)
 
 
-def _is_wifi_addr(addr):
+def fix_wifi_addr(addr:str) -> Optional[str]:
     if not addr:
-        return False
-    if re.match(r"^https?://", addr):
-        return True
-    m = re.search(r"(\d+\.\d+\.\d+\.\d+)", addr)
-    if m and m.group(1) != "127.0.0.1":
-        return True
-    return False
+        return None
+    if re.match(r"^https?://", addr): # eg: http://example.org
+        return addr
+    
+    # make a request
+    # eg: 10.0.0.1, 10.0.0.1:7912
+    if ':' not in addr:
+        addr += ":7912" # make default port 7912
+    try:
+        r = requests.get("http://"+addr+"/version", timeout=2)
+        r.raise_for_status()
+        return "http://"+addr
+    except:
+        return None
 
 
 def connect(addr=None):
@@ -103,7 +112,8 @@ def connect(addr=None):
     """
     if not addr or addr == '+':
         addr = os.getenv('ANDROID_DEVICE_IP')
-    if _is_wifi_addr(addr):
+    wifi_addr = fix_wifi_addr(addr)
+    if wifi_addr:
         return connect_wifi(addr)
     return connect_usb(addr)
 
@@ -127,7 +137,7 @@ def connect_adb_wifi(addr):
     return connect_usb(addr)
 
 
-def connect_usb(serial=None, healthcheck=True):
+def connect_usb(serial=None, healthcheck=False):
     """
     Args:
         serial (str): android device serial
@@ -147,24 +157,27 @@ def connect_usb(serial=None, healthcheck=True):
     # adb = adbutils.Adb(serial)
     lport = device.forward_port(7912)
     d = connect_wifi('127.0.0.1:' + str(lport))
+    d._serial = device.serial
+    if not d.agent_alive:
+        warnings.warn("backend atx-agent is not alive, start again ...",
+                    RuntimeWarning)
+        # TODO: /data/local/tmp might not be execuable and atx-agent can be somewhere else
+        device.shell(["/data/local/tmp/atx-agent", "server", "-d"])
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if d.agent_alive:
+                break
+        else:
+            raise RuntimeError("atx-agent recover failed")
+
     if healthcheck:
-        if not d.agent_alive:
-            warnings.warn("backend atx-agent is not alive, start again ...",
-                        RuntimeWarning)
-            # TODO: /data/local/tmp might not be execuable and atx-agent can be somewhere else
-            device.shell_output("/data/local/tmp/atx-agent", "server", "-d")
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                if d.alive:
-                    break
-        elif not d.alive:
-            warnings.warn("backend uiautomator2 is not alive, start again ...",
-                        RuntimeWarning)
-            d.reset_uiautomator()
+        if not d.alive:
+            warnings.warn("backend uiautomator2 is not alive, start again ...",RuntimeWarning)
+            d.healthcheck()
     return d
 
 
-def connect_wifi(addr=None):
+def connect_wifi(addr:str) -> "UIAutomatorServer":
     """
     Args:
         addr (str) uiautomator server address.
@@ -178,15 +191,15 @@ def connect_wifi(addr=None):
     Examples:
         connect_wifi("10.0.0.1")
     """
-    if '://' not in addr:
-        addr = 'http://' + addr
-    if addr.startswith('http://'):
-        u = urlparse.urlparse(addr)
-        host = u.hostname
-        port = u.port or 7912
-        return UIAutomatorServer(host, port)
-    else:
-        raise ConnectError("address should start with http://")
+    if not re.match(r"^https?://", addr):
+        addr = "http://" + addr
+    # fixed_addr = fix_wifi_addr(addr)
+    # if fixed_addr is None:
+        # raise ConnectError("addr is invalid or atx-agent is not running", addr)
+    u = urlparse.urlparse(addr)
+    host = u.hostname
+    port = u.port or 7912
+    return UIAutomatorServer(host, port)
 
 
 class TimeoutRequestsSession(requests.Session):
@@ -209,7 +222,7 @@ class TimeoutRequestsSession(requests.Session):
             print(
                 datetime.now().strftime("%H:%M:%S.%f")[:-3],
                 "$ curl -X {method} -d '{data}' '{url}'".format(
-                    method=method, url=url, data=data))
+                    method=method, url=url, data=data.decode()))
         try:
             resp = super(TimeoutRequestsSession, self).request(
                 method, url, **kwargs)
@@ -269,6 +282,7 @@ class UIAutomatorServer(object):
         """
         self._host = host
         self._port = port
+        self._serial = None
         self._reqsess = TimeoutRequestsSession(
         )  # use requests.Session to enable HTTP Keep-Alive
         self._server_url = 'http://{}:{}'.format(host, port)
@@ -332,6 +346,8 @@ class UIAutomatorServer(object):
 
     @property
     def serial(self):
+        if self._serial:
+            return self._serial
         return self.shell(['getprop', 'ro.serialno'])[0].strip()
 
     @property
@@ -560,20 +576,26 @@ class UIAutomatorServer(object):
 
         Raises:
             RuntimeError
+        
+        Notes:
+            OnePlus(China) need to treat specially.
+                1. stop uiautomator keeper
+                2. start ATX app
+                3. stop uiautomator keeper (ATX app will be killed by uiautomator)
+                4. start ATX app again. (ATX app will be killed again by uiautomator)
+                5. uiautomator will go back to normal
         """
-        # self.open_identify()
-        self._reqsess.delete(
-            self.path2url('/uiautomator'))  # stop uiautomator keeper first
-        # wait = not unlock  # should not wait IdentifyActivity open or it will stuck sometimes
-        # self.app_start(  # may also stuck here.
-        #     'com.github.uiautomator',
-        #     '.MainActivity',
-        #     wait=False,
-        #     stop=True)
-        time.sleep(.5)
+        brand = self.shell("getprop ro.product.brand").output.strip()
+        print("Product-brand:", brand)
+        self.uiautomator.stop() # stop uiautomator keeper first
 
-        # launch atx-agent uiautomator keeper
-        self._reqsess.post(self.path2url('/uiautomator'))
+        if brand.lower() == "oneplus":
+            self.app_start("com.github.uiautomator", launch_timeout=10)
+            self.uiautomator.start()
+            time.sleep(1.5)
+            self.app_start("com.github.uiautomator")
+        else:
+            self.uiautomator.start()
 
         # wait until uiautomator2 service working
         deadline = time.time() + 20.0
@@ -581,6 +603,8 @@ class UIAutomatorServer(object):
             print(
                 time.strftime("[%Y-%m-%d %H:%M:%S]"),
                 "uiautomator is starting ...")
+            if not self.uiautomator.running():
+                break
             if self.alive:
                 # keyevent BACK if current is com.github.uiautomator
                 # XiaoMi uiautomator will kill the app(com.github.uiautomator) when launch
@@ -608,6 +632,7 @@ class UIAutomatorServer(object):
         Raises:
             RuntimeError
         """
+        self.app_start("com.github.uiautomator")
         sh = self.ash
         if not sh.is_screen_on():
             print(time.strftime("[%Y-%m-%d %H:%M:%S]"), "wakeup screen")
@@ -763,12 +788,15 @@ class UIAutomatorServer(object):
                   extras={},
                   wait=True,
                   stop=False,
-                  unlock=False):
+                  unlock=False, launch_timeout=None):
         """ Launch application
         Args:
             pkg_name (str): package name
             activity (str): app activity
             stop (bool): Stop app before starting the activity. (require activity)
+        
+        Raises:
+            SessionBrokenError
         """
         if unlock:
             self.unlock()
@@ -806,10 +834,23 @@ class UIAutomatorServer(object):
         else:
             if stop:
                 self.app_stop(pkg_name)
-            self.shell([
-                'monkey', '-p', pkg_name, '-c',
-                'android.intent.category.LAUNCHER', '1'
-            ])
+            
+            # launch with atx-agent
+            data = {"flags": "-W -S"}
+            if launch_timeout:
+                data["timeout"] = str(launch_timeout)
+            resp = self._reqsess.post(
+                self.path2url("/session/" + pkg_name), data=data)
+            if resp.status_code != 200: # 410: Gone
+                raise SessionBrokenError(pkg_name, resp.text)
+            jsondata = resp.json()
+            if not jsondata["success"]:
+                raise SessionBrokenError(pkg_name,
+                                         jsondata["error"], jsondata["output"])
+            # self.shell([
+            #     'monkey', '-p', pkg_name, '-c',
+            #     'android.intent.category.LAUNCHER', '1'
+            # ])
 
     @retry(EnvironmentError, delay=.5, tries=3, jitter=.1)
     def current_app(self):
@@ -1158,6 +1199,12 @@ class UIAutomatorServer(object):
             raise SessionBrokenError(pkg_name)
         return Session(self, pkg_name, pid)
 
+    @property
+    @cache_return
+    def xpath(self):
+        import uiautomator2.xpath as xpath
+        return xpath.XPath(self)
+
     def __getattr__(self, attr):
         if attr in self._cached_plugins:
             return self._cached_plugins[attr]
@@ -1165,7 +1212,7 @@ class UIAutomatorServer(object):
             plugin_name = attr[4:]
             if plugin_name not in self.__plugins:
                 if plugin_name == 'xpath':
-                    import uiautomator2.ext.xpath as xpath
+                    import uiautomator2.xpath as xpath
                     xpath.init()
                 else:
                     raise ValueError(
